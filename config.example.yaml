@@ -1,0 +1,2 @@
+# Optional CLI configuration. The desktop app asks for a folder directly.
+folders: []
