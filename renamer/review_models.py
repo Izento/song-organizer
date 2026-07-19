@@ -272,7 +272,20 @@ class ReviewPlan:
         proposals: list[RenameProposal] | tuple[RenameProposal, ...],
     ) -> "ReviewPlan":
         """Return an equivalent plan with reviewed rename changes re-signed."""
-        updated = replace(self, rename_proposals=tuple(proposals), digest="")
+        return self.with_proposals(proposals, self.tag_proposals)
+
+    def with_proposals(
+        self,
+        rename_proposals: list[RenameProposal] | tuple[RenameProposal, ...],
+        tag_proposals: list[TagProposal] | tuple[TagProposal, ...],
+    ) -> "ReviewPlan":
+        """Return a re-signed plan with coordinated rename and tag changes."""
+        updated = replace(
+            self,
+            rename_proposals=tuple(rename_proposals),
+            tag_proposals=tuple(tag_proposals),
+            digest="",
+        )
         return replace(updated, digest=updated._computed_digest())
 
     def to_dict(self, include_digest: bool = True) -> dict[str, Any]:

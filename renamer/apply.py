@@ -22,7 +22,7 @@ from .review_models import (
     sha256_file,
 )
 from .runtime import atomic_write_json, ensure_app_dirs
-from .tag_writer import parse_stem, supports_tag_writing, write_tags_to_file
+from .tag_writer import supports_tag_writing, write_tags_to_file
 
 
 ProgressCallback = Callable[[str, int, int, ApplyResult | None], None]
@@ -128,13 +128,6 @@ def _preflight(
                 item.path,
                 f"Tag writing is not supported for {extension} files.",
             )
-        elif parse_stem(Path(item.path).stem) is None:
-            block(
-                item.id,
-                item.path,
-                f"Tag filename is not supported by the writer: {item.path}"
-            )
-
     rename_sources: dict[str, list[RenameProposal]] = {}
     for item in renames:
         if item.id not in blocked:
@@ -160,20 +153,6 @@ def _preflight(
                     item.path,
                     "Multiple tag proposals target one source file.",
                 )
-
-    renames_by_group = {item.decision_group_id: item for item in renames}
-    for tag in tags:
-        rename = renames_by_group.get(tag.decision_group_id)
-        if rename is None:
-            continue
-        conflicting = any(
-            "Conflicts with" in warning
-            for warning in (*rename.warnings, *tag.warnings)
-        )
-        if conflicting:
-            message = f"Conflicting rename and tag decisions selected for {tag.path}"
-            block(rename.id, rename.old_path, message)
-            block(tag.id, tag.path, message)
 
     eligible_tags = [item for item in tags if item.id not in blocked]
     if eligible_tags:
@@ -362,7 +341,9 @@ def _apply_tag(
             before=item.before,
             after=item.after,
         )
-        result = _retry_filesystem(lambda: write_tags_to_file(item.path))
+        result = _retry_filesystem(
+            lambda: write_tags_to_file(item.path, item.after)
+        )
         if result.get("status") not in {"updated", "already_ok"}:
             raise ApplyBlocked(result.get("reason", "Tag writer skipped file"))
         media = read_media(item.path)
@@ -701,10 +682,19 @@ def incomplete_batches() -> list[dict]:
     return batches
 
 
-def batches_requiring_recovery() -> list[dict]:
-    """Return interrupted journals that may still represent a file mutation."""
+def _batch_matches_root(batch: dict, root: str | None) -> bool:
+    if root is None:
+        return True
+    batch_root = batch.get("root")
+    return bool(batch_root) and path_key(batch_root) == path_key(root)
+
+
+def batches_requiring_recovery(root: str | None = None) -> list[dict]:
+    """Return interrupted journals, optionally limited to one review root."""
     batches = []
     for batch in incomplete_batches():
+        if not _batch_matches_root(batch, root):
+            continue
         actions = batch.get("actions", ())
         if any(
             action.get("status") in {"intent", "completed"}
@@ -718,8 +708,8 @@ def batches_requiring_recovery() -> list[dict]:
     return batches
 
 
-def latest_undoable_batch() -> dict | None:
-    """Return the newest batch that still has completed actions to undo."""
+def latest_undoable_batch(root: str | None = None) -> dict | None:
+    """Return the newest undoable batch, optionally limited to one root."""
     recoverable_statuses = {
         "completed",
         "failed",
@@ -731,6 +721,7 @@ def latest_undoable_batch() -> dict | None:
         (
             batch
             for batch in batch_history()
+            if _batch_matches_root(batch, root)
             if batch.get("status") in recoverable_statuses
             and any(
                 action.get("status") == "completed"

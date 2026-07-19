@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import queue
+import subprocess
 import threading
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -17,7 +19,11 @@ from renamer.apply import (
     latest_undoable_batch,
     undo_batch,
 )
-from renamer.review_api import analyze_folder
+from renamer.review_api import (
+    analyze_folder,
+    coordinate_tag_proposals,
+    refresh_rename_readiness,
+)
 from renamer.review_models import (
     ReviewPlan,
     canonical_path,
@@ -33,9 +39,14 @@ from renamer.runtime import (
 
 
 GUI_TITLE = "Ballad"
+_WINDOWS_APP_ID = "Ballad.SongOrganizer"
 _WINDOWS_UNSAFE_FILENAME_CHARS = set('<>:"/\\|?*')
 _FIXED_TREE_COLUMNS = {"selected", "action", "confidence"}
 _TREE_STYLE = "Ballad.Treeview"
+_REVIEW_REQUIRED_WARNING_PREFIXES = (
+    "Destination collides with another proposal.",
+    "Destination already exists:",
+)
 
 
 def _format_local_timestamp(value: str) -> str:
@@ -89,12 +100,65 @@ def _is_high_confidence_action(item) -> bool:
     return item.confidence == "high" and not item.warnings
 
 
-def _recommended_ids(plan: ReviewPlan) -> set[str]:
-    """Return high-confidence actions without unresolved safety warnings."""
+def _action_items(plan: ReviewPlan):
+    return (*plan.rename_proposals, *plan.tag_proposals)
+
+
+def _requires_review(item) -> bool:
+    return any(
+        warning.startswith(_REVIEW_REQUIRED_WARNING_PREFIXES)
+        for warning in item.warnings
+    )
+
+
+def _action_label(item, default: str) -> str:
+    return "Needs review" if _requires_review(item) else default
+
+
+def _grouped_action_ids(plan: ReviewPlan) -> dict[str, set[str]]:
+    groups: dict[str, set[str]] = {}
+    for item in _action_items(plan):
+        groups.setdefault(item.decision_group_id, set()).add(item.id)
+    return groups
+
+
+def _ready_ids(plan: ReviewPlan) -> set[str]:
+    items_by_group: dict[str, list] = {}
+    for item in _action_items(plan):
+        items_by_group.setdefault(item.decision_group_id, []).append(item)
     return {
         item.id
-        for item in (*plan.rename_proposals, *plan.tag_proposals)
-        if _is_high_confidence_action(item)
+        for items in items_by_group.values()
+        if not any(_requires_review(item) for item in items)
+        for item in items
+    }
+
+
+def _expand_group_selection(plan: ReviewPlan, selected_ids) -> set[str]:
+    groups = _grouped_action_ids(plan)
+    selected = set(selected_ids)
+    selected_groups = {
+        group_id
+        for group_id, item_ids in groups.items()
+        if selected & item_ids
+    }
+    return {
+        item_id
+        for group_id in selected_groups
+        for item_id in groups[group_id]
+    } & _ready_ids(plan)
+
+
+def _recommended_ids(plan: ReviewPlan) -> set[str]:
+    """Return high-confidence actions without unresolved safety warnings."""
+    items_by_group: dict[str, list] = {}
+    for item in _action_items(plan):
+        items_by_group.setdefault(item.decision_group_id, []).append(item)
+    return {
+        item.id
+        for items in items_by_group.values()
+        if all(_is_high_confidence_action(item) for item in items)
+        for item in items
     }
 
 
@@ -112,9 +176,25 @@ def _filename_validation_error(filename: str, old_path: str) -> str | None:
     return None
 
 
+def _set_windows_app_identity() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        set_app_id = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+        set_app_id.argtypes = [ctypes.c_wchar_p]
+        set_app_id.restype = ctypes.c_long
+        set_app_id(ctypes.c_wchar_p(_WINDOWS_APP_ID))
+    except (AttributeError, OSError, TypeError):
+        return
+
+
 class SongOrganizerApp:
     def __init__(self, root: tk.Tk | None = None):
+        _set_windows_app_identity()
         self.root = root or tk.Tk()
+        self._icon_handles: tuple[object, ...] = ()
         self.root.title(GUI_TITLE)
         self._set_window_icon()
         self.root.geometry("1180x720")
@@ -125,6 +205,7 @@ class SongOrganizerApp:
         self.plan: ReviewPlan | None = None
         self.selected_ids: set[str] = set()
         self._row_ids: dict[tuple[str, str], str] = {}
+        self._row_paths: dict[tuple[str, str], str] = {}
 
         self.folder_var = tk.StringVar()
         self.recursive_var = tk.BooleanVar(value=True)
@@ -144,16 +225,62 @@ class SongOrganizerApp:
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(100, self._poll_events)
-        self.root.after(250, self._show_startup_recovery)
 
     def _set_window_icon(self) -> None:
         icon_path = resource_path("ballad.ico")
         if not icon_path.is_file():
             return
         try:
+            self.root.iconbitmap(str(icon_path))
+        except tk.TclError:
+            pass
+        try:
             self.root.iconbitmap(default=str(icon_path))
         except tk.TclError:
-            return
+            pass
+        if os.name == "nt":
+            self._set_windows_icon_handles(icon_path)
+
+    def _set_windows_icon_handles(self, icon_path: Path) -> None:
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            load_image = user32.LoadImageW
+            load_image.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_wchar_p,
+                ctypes.c_uint,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint,
+            ]
+            load_image.restype = ctypes.c_void_p
+            send_message = user32.SendMessageW
+            send_message.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_size_t,
+                ctypes.c_void_p,
+            ]
+            send_message.restype = ctypes.c_void_p
+            hwnd = ctypes.c_void_p(self.root.winfo_id())
+            handles = []
+            for icon_size, icon_kind in ((32, 1), (16, 0)):
+                handle = load_image(
+                    None,
+                    str(icon_path),
+                    1,
+                    icon_size,
+                    icon_size,
+                    0x10,
+                )
+                if handle:
+                    send_message(hwnd, 0x0080, icon_kind, handle)
+                    handles.append(handle)
+            self._icon_handles = tuple(handles)
+        except (AttributeError, OSError, TypeError):
+            self._icon_handles = ()
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=10)
@@ -197,41 +324,64 @@ class SongOrganizerApp:
 
         bottom = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         bottom.pack(fill=tk.X)
+        bottom.columnconfigure(1, weight=1)
+        selection_controls = ttk.Frame(bottom)
+        selection_controls.grid(row=0, column=0, sticky=tk.W)
         ttk.Button(
-            bottom,
+            selection_controls,
             text="Select recommended",
             command=self._select_recommended,
         ).pack(side=tk.LEFT)
         ttk.Button(
-            bottom,
-            text="Select all",
+            selection_controls,
+            text="Select all ready",
             command=self._select_all,
         ).pack(side=tk.LEFT, padx=(8, 0))
         self.edit_button = ttk.Button(
-            bottom,
+            selection_controls,
             text="Edit filename",
             command=self._edit_selected_filename,
         )
         self.edit_button.pack(side=tk.LEFT, padx=(8, 0))
-        self.apply_button = ttk.Button(
-            bottom, text="Apply selected", command=self._apply
+        ttk.Label(bottom, textvariable=self.status_var).grid(
+            row=0,
+            column=1,
+            sticky=tk.EW,
+            padx=12,
         )
-        self.apply_button.pack(side=tk.LEFT, padx=8)
+        secondary_actions = ttk.Frame(bottom)
+        secondary_actions.grid(row=0, column=2, sticky=tk.E)
         self.cancel_button = ttk.Button(
-            bottom, text="Cancel", command=self._cancel
+            secondary_actions, text="Cancel", command=self._cancel
         )
         self.cancel_button.pack(side=tk.LEFT)
         self.history_button = ttk.Button(
-            bottom, text="History", command=self._show_history
+            secondary_actions, text="History", command=self._show_history
         )
         self.history_button.pack(side=tk.LEFT)
         self.undo_button = ttk.Button(
-            bottom, text="Undo latest", command=self._undo_latest
+            secondary_actions, text="Undo latest", command=self._undo_latest
         )
         self.undo_button.pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(bottom, textvariable=self.status_var).pack(
-            side=tk.LEFT, fill=tk.X, expand=True
+        ttk.Separator(secondary_actions, orient=tk.VERTICAL).pack(
+            side=tk.LEFT,
+            fill=tk.Y,
+            padx=10,
         )
+        self.apply_button = tk.Button(
+            secondary_actions,
+            text="Apply selected",
+            command=self._apply,
+            background="#1f6feb",
+            activebackground="#388bfd",
+            foreground="white",
+            activeforeground="white",
+            font=("TkDefaultFont", 10, "bold"),
+            padx=12,
+            pady=2,
+        )
+        self.apply_button.pack(side=tk.LEFT)
+        self._update_apply_button()
 
     def _make_tree(self, parent: ttk.Frame, key: str) -> ttk.Treeview:
         if key == "renames":
@@ -276,16 +426,14 @@ class SongOrganizerApp:
                 "confidence": 72,
             }
         else:
-            columns = ("selected", "action", "file", "details", "confidence")
+            columns = ("action", "file", "details", "confidence")
             headings = {
-                "selected": "",
                 "action": "Action",
                 "file": "File",
                 "details": "Details",
                 "confidence": "Confidence",
             }
             widths = {
-                "selected": 26,
                 "action": 140,
                 "file": 350,
                 "details": 420,
@@ -319,6 +467,10 @@ class SongOrganizerApp:
             "<Button-1>",
             lambda event, name=key: self._handle_tree_click(name, event),
         )
+        tree.bind(
+            "<Button-3>",
+            lambda event, name=key: self._handle_tree_context_menu(name, event),
+        )
         return tree
 
     def _browse(self) -> None:
@@ -329,13 +481,15 @@ class SongOrganizerApp:
     def _set_busy(self, busy: bool) -> None:
         state = tk.DISABLED if busy else tk.NORMAL
         self.analyze_button.configure(state=state)
-        self.apply_button.configure(state=state)
         self.edit_button.configure(state=state)
         self.cancel_button.configure(state=tk.NORMAL if busy else tk.DISABLED)
         self.history_button.configure(state=state)
         self.undo_button.configure(state=state)
         if busy:
+            self.apply_button.configure(state=tk.DISABLED)
             self.status_var.set("Working…")
+        else:
+            self._update_apply_button()
 
     def _analyze(self) -> None:
         folder = self.folder_var.get().strip()
@@ -366,7 +520,7 @@ class SongOrganizerApp:
                     cancel_event=self.cancel_event,
                 )
                 self.events.put(("analysis-complete", plan))
-            except Exception as exc:
+            except Exception as exc:  # pylint: disable=broad-exception-caught
                 self.events.put(("failed", str(exc)))
 
         self.worker = threading.Thread(target=worker, daemon=True)
@@ -379,7 +533,8 @@ class SongOrganizerApp:
         if not self.selected_ids:
             messagebox.showinfo("Nothing selected", "Select at least one proposal.")
             return
-        if batches_requiring_recovery():
+        pending = batches_requiring_recovery(self.plan.root)
+        if pending:
             messagebox.showwarning(
                 "Recovery required",
                 "Undo the latest incomplete batch from the History window before "
@@ -393,9 +548,10 @@ class SongOrganizerApp:
                 "The reviewed plan no longer matches its digest. Analyze again.",
             )
             return
+        group_count = self._selection_group_count()
         if not messagebox.askyesno(
             "Confirm selected changes",
-            f"Apply {len(self.selected_ids)} selected rename/tag actions?\n\n"
+            f"Apply the coordinated changes for {group_count} selected song(s)?\n\n"
             "The reviewed plan will be revalidated before any file is changed.",
         ):
             return
@@ -415,7 +571,7 @@ class SongOrganizerApp:
                     ),
                 )
                 self.events.put(("apply-complete", results))
-            except Exception as exc:
+            except Exception as exc:  # pylint: disable=broad-exception-caught
                 self.events.put(("failed", str(exc)))
 
         self.worker = threading.Thread(target=worker, daemon=True)
@@ -427,7 +583,8 @@ class SongOrganizerApp:
             self.status_var.set("Cancellation requested…")
 
     def _undo_latest(self) -> None:
-        batch = latest_undoable_batch()
+        root = self.plan.root if self.plan is not None else self.folder_var.get().strip()
+        batch = latest_undoable_batch(root or None)
         if batch is None:
             messagebox.showinfo("Nothing to undo", "No recoverable batch is available.")
             return
@@ -443,7 +600,7 @@ class SongOrganizerApp:
             try:
                 results = undo_batch(batch["batch_id"])
                 self.events.put(("undo-complete", results))
-            except Exception as exc:
+            except Exception as exc:  # pylint: disable=broad-exception-caught
                 self.events.put(("failed", str(exc)))
 
         self.worker = threading.Thread(target=worker, daemon=True)
@@ -469,19 +626,6 @@ class SongOrganizerApp:
             "completed or interrupted batch. Restore remains guarded by "
             "the batch journal.",
         ).pack(fill=tk.X, padx=10, pady=(0, 10))
-
-    def _show_startup_recovery(self) -> None:
-        pending = batches_requiring_recovery()
-        if pending:
-            self.status_var.set(
-                f"Recovery required: {len(pending)} incomplete batch(es)."
-            )
-            messagebox.showwarning(
-                "Recovery required",
-                f"{len(pending)} previous batch(es) did not finish cleanly. "
-                "Use Undo latest to restore completed actions, then analyze "
-                "the folder again before applying new changes.",
-            )
 
     def _poll_events(self) -> None:
         try:
@@ -563,6 +707,7 @@ class SongOrganizerApp:
         for tree in self.trees.values():
             tree.delete(*tree.get_children())
         self._row_ids.clear()
+        self._row_paths.clear()
 
     def _populate_plan(self, plan: ReviewPlan) -> None:
         self._clear_trees()
@@ -570,21 +715,21 @@ class SongOrganizerApp:
             self._insert_change_row(
                 "renames",
                 item.id,
-                "Rename",
+                _action_label(item, "Rename"),
                 item.old_path,
                 item.current_values.get("filename", ""),
                 item.proposed_values.get("filename", ""),
-                item.confidence,
+                "review" if _requires_review(item) else item.confidence,
             )
         for item in plan.tag_proposals:
             self._insert_change_row(
                 "tags",
                 item.id,
-                "Tag repair",
+                _action_label(item, "Tag repair"),
                 item.path,
                 _tag_display(item.before),
                 _tag_display(item.after),
-                item.confidence,
+                "review" if _requires_review(item) else item.confidence,
             )
         for item in plan.duplicate_findings:
             self._insert_duplicate_finding(item)
@@ -625,9 +770,10 @@ class SongOrganizerApp:
         row = tree.insert(
             "",
             tk.END,
-            values=("☐", action, display_file, summary, confidence),
+            values=(action, display_file, summary, confidence),
         )
         self._row_ids[(tree_name, row)] = item_id
+        self._row_paths[(tree_name, row)] = path
 
     def _insert_change_row(
         self,
@@ -646,6 +792,80 @@ class SongOrganizerApp:
         values.extend((current, proposed, confidence))
         row = tree.insert("", tk.END, values=values)
         self._row_ids[(tree_name, row)] = item_id
+        self._row_paths[(tree_name, row)] = path
+
+    def _handle_tree_context_menu(self, tree_name: str, event):
+        tree = self.trees[tree_name]
+        row = tree.identify_row(event.y)
+        if not row:
+            return "break"
+        if row not in tree.selection():
+            tree.selection_set(row)
+        path = self._row_paths.get((tree_name, row))
+        if not path:
+            return "break"
+
+        menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(
+            label="Open in File Explorer",
+            command=lambda: self._open_in_file_explorer(path),
+        )
+        menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _open_in_file_explorer(self, path: str) -> None:
+        target = Path(path)
+        if not target.is_file():
+            messagebox.showwarning(
+                "File unavailable",
+                f"This file is no longer available:\n{target}",
+            )
+            return
+        try:
+            options = {}
+            if os.name == "nt":
+                options["creationflags"] = subprocess.CREATE_NO_WINDOW
+                subprocess.Popen(
+                    ["explorer.exe", "/select,", str(target)],
+                    **options,
+                )
+            else:
+                subprocess.Popen(["xdg-open", str(target.parent)], **options)
+        except OSError as exc:
+            messagebox.showerror(
+                "Could not open File Explorer",
+                str(exc),
+            )
+
+    def _proposal_for_id(self, item_id: str):
+        plan = getattr(self, "plan", None)
+        if plan is None:
+            return None
+        return next(
+            (item for item in _action_items(plan) if item.id == item_id),
+            None,
+        )
+
+    def _selection_group_count(self) -> int:
+        plan = getattr(self, "plan", None)
+        if plan is None:
+            return len(self.selected_ids)
+        groups = _grouped_action_ids(plan)
+        return sum(bool(self.selected_ids & item_ids) for item_ids in groups.values())
+
+    def _update_apply_button(self) -> None:
+        button = getattr(self, "apply_button", None)
+        if button is None:
+            return
+        group_count = self._selection_group_count()
+        button.configure(
+            text=(
+                f"Apply selected ({group_count})"
+                if group_count
+                else "Apply selected"
+            ),
+            state=tk.NORMAL if group_count else tk.DISABLED,
+        )
 
     def _handle_tree_click(self, tree_name: str, event):
         tree = self.trees[tree_name]
@@ -683,10 +903,34 @@ class SongOrganizerApp:
         clicked_id = self._row_ids.get((tree_name, row))
         if not clicked_id or not item_ids:
             return "break"
+        clicked = self._proposal_for_id(clicked_id)
+        if clicked is None:
+            if clicked_id in self.selected_ids:
+                self._set_selected_ids(self.selected_ids - item_ids)
+            else:
+                self._set_selected_ids(self.selected_ids | item_ids)
+            return "break"
+        if _requires_review(clicked):
+            self.status_var.set(
+                "Resolve this destination conflict before selecting the song."
+            )
+            return "break"
+        groups = _grouped_action_ids(self.plan)
+        selected_groups = {
+            proposal.decision_group_id
+            for item_id in item_ids
+            if (proposal := self._proposal_for_id(item_id)) is not None
+            and not _requires_review(proposal)
+        }
+        grouped_ids = {
+            item_id
+            for group_id in selected_groups
+            for item_id in groups[group_id]
+        }
         if clicked_id in self.selected_ids:
-            self._set_selected_ids(self.selected_ids - item_ids)
+            self._set_selected_ids(self.selected_ids - grouped_ids)
         else:
-            self._set_selected_ids(self.selected_ids | item_ids)
+            self._set_selected_ids(self.selected_ids | grouped_ids)
         return "break"
 
     def _select_recommended(self) -> None:
@@ -694,17 +938,20 @@ class SongOrganizerApp:
             return
         recommended = _recommended_ids(self.plan)
         self._set_selected_ids(recommended)
-        self.status_var.set(f"Selected {len(recommended)} recommended actions.")
+        self.status_var.set(
+            f"Selected {self._selection_group_count()} recommended songs."
+        )
 
     def _select_all(self) -> None:
         if self.plan is None:
             return
-        selected = {
-            item.id
-            for item in (*self.plan.rename_proposals, *self.plan.tag_proposals)
-        }
+        selected = _ready_ids(self.plan)
         self._set_selected_ids(selected)
-        self.status_var.set(f"Selected all {len(selected)} actions.")
+        skipped = len(_grouped_action_ids(self.plan)) - self._selection_group_count()
+        self.status_var.set(
+            f"Selected {self._selection_group_count()} ready songs; "
+            f"{skipped} need review."
+        )
 
     def _edit_selected_filename(self) -> None:
         if self.plan is None:
@@ -775,18 +1022,31 @@ class SongOrganizerApp:
             updated if item.id == proposal.id else item
             for item in self.plan.rename_proposals
         )
-        self.plan = self.plan.with_rename_proposals(proposals)
-        self._row_ids[("renames", row)] = new_id
-        if proposal.id in self.selected_ids:
-            self.selected_ids.remove(proposal.id)
-            self.selected_ids.add(new_id)
-        values = list(tree.item(row, "values"))
-        values[3] = updated.proposed_values.get("filename", "")
-        tree.item(row, values=values)
+        proposals = refresh_rename_readiness(proposals)
+        tags, _, _ = coordinate_tag_proposals(
+            proposals,
+            list(self.plan.tag_proposals),
+        )
+        was_selected = proposal.id in self.selected_ids
+        self.plan = self.plan.with_proposals(proposals, tags)
+        self._populate_plan(self.plan)
+        if was_selected:
+            group_ids = _grouped_action_ids(self.plan).get(
+                updated.decision_group_id,
+                set(),
+            )
+            self._set_selected_ids(group_ids)
+        else:
+            self._set_selected_ids(self.selected_ids - {proposal.id})
         self.status_var.set(f"Corrected proposed filename to {filename}.")
 
     def _set_selected_ids(self, selected_ids) -> None:
-        self.selected_ids = set(selected_ids)
+        plan = getattr(self, "plan", None)
+        self.selected_ids = (
+            _expand_group_selection(plan, selected_ids)
+            if plan is not None
+            else set(selected_ids)
+        )
         for tree_name in ("renames", "tags"):
             tree = self.trees[tree_name]
             for row in tree.get_children(""):
@@ -799,6 +1059,7 @@ class SongOrganizerApp:
                         else "☐"
                     )
                     tree.item(row, values=values)
+        self._update_apply_button()
 
     def _close(self) -> None:
         if self.worker is not None and self.worker.is_alive():
@@ -809,11 +1070,27 @@ class SongOrganizerApp:
             self.cancel_event.set()
             self.root.after(100, self._close)
             return
+        self._release_windows_icon_handles()
         self.root.destroy()
+
+    def _release_windows_icon_handles(self) -> None:
+        if os.name != "nt" or not self._icon_handles:
+            return
+        try:
+            import ctypes
+
+            destroy_icon = ctypes.windll.user32.DestroyIcon
+            destroy_icon.argtypes = [ctypes.c_void_p]
+            for handle in self._icon_handles:
+                destroy_icon(handle)
+        except (AttributeError, OSError, TypeError):
+            pass
+        self._icon_handles = ()
 
 
 def run() -> None:
     ensure_app_dirs()
+    _set_windows_app_identity()
     root = tk.Tk()
     SongOrganizerApp(root)
     root.mainloop()

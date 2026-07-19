@@ -18,8 +18,17 @@ class _FakeTree:
         self.rows = rows
         self.selected = tuple(selected)
 
-    def get_children(self, _parent):
+    def get_children(self, _parent=""):
         return tuple(self.rows)
+
+    def delete(self, *rows):
+        for row in rows:
+            self.rows.pop(row, None)
+
+    def insert(self, _parent, _index, values):
+        row = f"row-{len(self.rows)}"
+        self.rows[row] = tuple(values)
+        return row
 
     def selection(self):
         return self.selected
@@ -95,6 +104,109 @@ def test_select_all_selects_only_actionable_proposals(tmp_path):
     assert app.trees["tags"].rows["shared-row"][0] == "☑"
 
 
+def test_checkbox_selects_the_entire_decision_group(tmp_path):
+    source = tmp_path / "old.mp3"
+    source.write_bytes(b"audio")
+    snapshot = FileSnapshot.capture(str(source))
+    rename = RenameProposal(
+        id="rename-1",
+        decision_group_id="group-1",
+        snapshot=snapshot,
+        old_path=str(source),
+        new_path=str(tmp_path / "new.mp3"),
+        current_values={"filename": source.name},
+        proposed_values={"filename": "new.mp3"},
+        confidence="high",
+        reason="test",
+    )
+    tag = TagProposal(
+        id="tag-1",
+        decision_group_id="group-1",
+        snapshot=snapshot,
+        path=str(source),
+        before={"artist": "Old"},
+        after={"artist": "New"},
+        confidence="high",
+        reason="test",
+    )
+    app = SongOrganizerApp.__new__(SongOrganizerApp)
+    app.plan = ReviewPlan.create(
+        str(tmp_path),
+        False,
+        rename_proposals=[rename],
+        tag_proposals=[tag],
+    )
+    app.selected_ids = set()
+    app._row_ids = {
+        ("renames", "rename-row"): rename.id,
+        ("tags", "tag-row"): tag.id,
+    }
+    app.trees = {
+        "renames": _FakeTree({"rename-row": ("☐",)}),
+        "tags": _FakeTree({"tag-row": ("☐",)}),
+    }
+    app.status_var = _FakeStatus()
+
+    app._handle_tree_click("renames", SimpleNamespace(x=5, y="rename-row"))
+
+    assert app.selected_ids == {rename.id, tag.id}
+    assert app.trees["renames"].rows["rename-row"][0] == "☑"
+    assert app.trees["tags"].rows["tag-row"][0] == "☑"
+
+
+def test_select_all_ready_skips_destination_collisions(tmp_path):
+    source = tmp_path / "old.mp3"
+    source.write_bytes(b"audio")
+    snapshot = FileSnapshot.capture(str(source))
+    safe = RenameProposal(
+        id="rename-safe",
+        decision_group_id="safe",
+        snapshot=snapshot,
+        old_path=str(source),
+        new_path=str(tmp_path / "safe.mp3"),
+        current_values={"filename": source.name},
+        proposed_values={"filename": "safe.mp3"},
+        confidence="high",
+        reason="test",
+    )
+    review = RenameProposal(
+        id="rename-review",
+        decision_group_id="review",
+        snapshot=snapshot,
+        old_path=str(source),
+        new_path=str(tmp_path / "collision.mp3"),
+        current_values={"filename": source.name},
+        proposed_values={"filename": "collision.mp3"},
+        confidence="high",
+        reason="test",
+        warnings=("Destination already exists: collision.mp3",),
+    )
+    app = SongOrganizerApp.__new__(SongOrganizerApp)
+    app.plan = ReviewPlan.create(
+        str(tmp_path),
+        False,
+        rename_proposals=[safe, review],
+    )
+    app.selected_ids = set()
+    app._row_ids = {
+        ("renames", "safe-row"): safe.id,
+        ("renames", "review-row"): review.id,
+    }
+    app.trees = {
+        "renames": _FakeTree(
+            {"safe-row": ("☐",), "review-row": ("☐",)}
+        ),
+        "tags": _FakeTree({}),
+    }
+    app.status_var = _FakeStatus()
+
+    app._select_all()
+
+    assert app.selected_ids == {safe.id}
+    assert app.trees["renames"].rows["safe-row"][0] == "☑"
+    assert app.trees["renames"].rows["review-row"][0] == "☐"
+
+
 def test_checkbox_toggles_all_shift_selected_rows():
     app = SongOrganizerApp.__new__(SongOrganizerApp)
     app.selected_ids = set()
@@ -122,6 +234,61 @@ def test_checkbox_toggles_all_shift_selected_rows():
     assert app.selected_ids == {"rename-1", "rename-2"}
     assert app.trees["renames"].rows["row-1"][0] == "☑"
     assert app.trees["renames"].rows["row-2"][0] == "☑"
+
+
+def test_right_click_file_opens_context_menu_for_exact_path(monkeypatch):
+    app = SongOrganizerApp.__new__(SongOrganizerApp)
+    app.root = object()
+    app._row_paths = {
+        ("renames", "row-1"): r"F:\Music\Hip-Hop\Artist - Song.mp3",
+    }
+    app.trees = {
+        "renames": _FakeTree({"row-1": ("☐",)}, selected=()),
+    }
+    opened = []
+    app._open_in_file_explorer = opened.append
+    menus = []
+
+    class _FakeMenu:
+        def __init__(self, *_args, **_kwargs):
+            self.command = None
+            menus.append(self)
+
+        def add_command(self, *, command, **_kwargs):
+            self.command = command
+
+        def tk_popup(self, x, y):
+            assert (x, y) == (40, 50)
+            self.command()
+
+    monkeypatch.setattr(gui_app.tk, "Menu", _FakeMenu)
+
+    result = app._handle_tree_context_menu(
+        "renames",
+        SimpleNamespace(x_root=40, y_root=50, y="row-1"),
+    )
+
+    assert result == "break"
+    assert app.trees["renames"].selection() == ("row-1",)
+    assert opened == [r"F:\Music\Hip-Hop\Artist - Song.mp3"]
+    assert len(menus) == 1
+
+
+def test_open_file_explorer_passes_target_as_separate_argument(tmp_path, monkeypatch):
+    path = tmp_path / "Artist - Song.mp3"
+    path.write_bytes(b"audio")
+    app = SongOrganizerApp.__new__(SongOrganizerApp)
+    calls = []
+
+    def fake_popen(command, **options):
+        calls.append((command, options))
+
+    monkeypatch.setattr(gui_app.subprocess, "Popen", fake_popen)
+
+    app._open_in_file_explorer(str(path))
+
+    assert calls
+    assert calls[0][0] == ["explorer.exe", "/select,", str(path)]
 
 
 def test_tag_display_uses_compact_artist_title_values():
@@ -245,11 +412,15 @@ def test_edit_selected_filename_updates_plan_and_selection(tmp_path, monkeypatch
     )
     app.selected_ids = {proposal.id}
     app._row_ids = {("renames", "rename-row"): proposal.id}
+    app._row_paths = {}
     app.trees = {
         "renames": _FakeTree(
             {"rename-row": ("☑", "Rename", str(source), "old summary", "high")},
             selected=("rename-row",),
-        )
+        ),
+        "tags": _FakeTree({}),
+        "duplicates": _FakeTree({}),
+        "errors": _FakeTree({}),
     }
     app.root = None
     app.status_var = _FakeStatus()
@@ -267,9 +438,9 @@ def test_edit_selected_filename_updates_plan_and_selection(tmp_path, monkeypatch
     assert updated.id in app.selected_ids
     assert proposal.id not in app.selected_ids
     assert app.plan.validate_digest()
-    assert (
-        app.trees["renames"].rows["rename-row"][3]
-        == "Artist - Correct Spelling.mp3"
+    assert any(
+        values[3] == "Artist - Correct Spelling.mp3"
+        for values in app.trees["renames"].rows.values()
     )
 
 

@@ -1,5 +1,6 @@
 # pylint: disable=import-error
 
+import json
 from pathlib import Path
 
 from renamer import apply as apply_module
@@ -26,6 +27,40 @@ def _test_app_paths(root: Path):
         if key != "config":
             path.mkdir(parents=True, exist_ok=True)
     return paths
+
+
+def test_recovery_queries_can_be_scoped_to_review_root(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    paths = _test_app_paths(state)
+    monkeypatch.setattr(apply_module, "ensure_app_dirs", lambda: paths)
+    first_root = tmp_path / "first-music"
+    second_root = tmp_path / "second-music"
+
+    for batch_id, root in (("first", first_root), ("second", second_root)):
+        (paths["journals"] / f"{batch_id}.json").write_text(
+            json.dumps(
+                {
+                    "batch_id": batch_id,
+                    "root": str(root),
+                    "status": "applying",
+                    "actions": [{"status": "completed"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    assert [
+        batch["batch_id"]
+        for batch in apply_module.batches_requiring_recovery(str(first_root))
+    ] == ["first"]
+    assert [
+        batch["batch_id"]
+        for batch in apply_module.batches_requiring_recovery(str(second_root))
+    ] == ["second"]
+    assert (
+        apply_module.latest_undoable_batch(str(second_root))["batch_id"]
+        == "second"
+    )
 
 
 def test_apply_uses_reviewed_rename_and_undo(tmp_path, monkeypatch):
@@ -68,10 +103,11 @@ def test_tag_apply_restores_backup(tmp_path, monkeypatch):
     source.write_bytes(b"audio")
     state = tmp_path / "state"
     monkeypatch.setattr(apply_module, "ensure_app_dirs", lambda: _test_app_paths(state))
+    written = []
     monkeypatch.setattr(
         apply_module,
         "write_tags_to_file",
-        lambda _path: {"status": "updated"},
+        lambda path, after: written.append((path, after)) or {"status": "updated"},
     )
     monkeypatch.setattr(
         apply_module,
@@ -102,6 +138,7 @@ def test_tag_apply_restores_backup(tmp_path, monkeypatch):
 
     assert results[0].status == "succeeded"
     assert Path(results[0].backup_path).exists()
+    assert written == [(str(source), {"artist": "Artist", "title": "Song"})]
 
 
 def test_apply_rejects_existing_unrelated_destination(tmp_path, monkeypatch):
@@ -132,11 +169,26 @@ def test_apply_rejects_existing_unrelated_destination(tmp_path, monkeypatch):
     assert destination.read_bytes() == b"unrelated"
 
 
-def test_apply_preflights_tag_writer_filename_support(tmp_path, monkeypatch):
+def test_apply_writes_reviewed_tags_for_nonstandard_filename(tmp_path, monkeypatch):
     source = tmp_path / "NoArtistTitle.mp3"
     source.write_bytes(b"source")
     monkeypatch.setattr(
         apply_module, "ensure_app_dirs", lambda: _test_app_paths(tmp_path / "state")
+    )
+    monkeypatch.setattr(
+        apply_module,
+        "write_tags_to_file",
+        lambda _path, _after: {"status": "updated"},
+    )
+    monkeypatch.setattr(
+        apply_module,
+        "read_media",
+        lambda path: MediaRead(
+            path=path,
+            status="ok",
+            container="MP3",
+            tags={"artist": "New", "title": "Title"},
+        ),
     )
     proposal = TagProposal(
         id="tag-unsupported-name",
@@ -152,8 +204,7 @@ def test_apply_preflights_tag_writer_filename_support(tmp_path, monkeypatch):
 
     results = apply_module.apply_review_plan(plan, [proposal.id])
 
-    assert results[0].status == "blocked"
-    assert "not supported by the writer" in results[0].message
+    assert results[0].status == "succeeded"
     assert source.read_bytes() == b"source"
 
 

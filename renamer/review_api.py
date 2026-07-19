@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import os
 from pathlib import Path
 from typing import Callable
 
-from .extractor import extract_track, scan_folder
+from .extractor import TrackInfo, extract_track, scan_folder
 from .formatter import build_filename, split_feat
 from .media import read_media
 from .musicbrainz import enrich_track
@@ -15,6 +16,7 @@ from .review_models import (
     FileSnapshot,
     RenameProposal,
     ReviewPlan,
+    TagProposal,
     canonical_path,
     path_key,
     proposal_id,
@@ -25,10 +27,15 @@ from .regular_parser import (
     parse_regular_filename,
     split_feature_names,
 )
-from .tag_audit import audit_tags_for_folder
+from .tag_audit import audit_tags_for_folder, expected_tags_from_filename
 
 
 ProgressCallback = Callable[[str, int, int, str], None]
+_ONLINE_EXTRACTION_WORKERS = 4
+_READINESS_WARNING_PREFIXES = (
+    "Destination collides with another proposal.",
+    "Destination already exists:",
+)
 
 
 def _emit(
@@ -118,6 +125,209 @@ def _proposal_identity(values: dict[str, str]) -> tuple[str, str, tuple[str, ...
     )
 
 
+def _with_rename_warning(item: RenameProposal, message: str) -> RenameProposal:
+    if message in item.warnings:
+        return item
+    return RenameProposal(
+        **{
+            **item.to_dict(),
+            "snapshot": item.snapshot,
+            "warnings": tuple(item.warnings) + (message,),
+        }
+    )
+
+
+def _without_readiness_warnings(item: RenameProposal) -> RenameProposal:
+    warnings = tuple(
+        warning
+        for warning in item.warnings
+        if not warning.startswith(_READINESS_WARNING_PREFIXES)
+    )
+    if warnings == item.warnings:
+        return item
+    return RenameProposal(
+        **{
+            **item.to_dict(),
+            "snapshot": item.snapshot,
+            "warnings": warnings,
+        }
+    )
+
+
+def _coordinated_tag_proposal(
+    rename: RenameProposal,
+    existing: TagProposal | None,
+) -> TagProposal | None:
+    snapshot = existing.snapshot if existing is not None else rename.snapshot
+    current = dict(existing.before if existing is not None else snapshot.tags)
+    expected, _ = expected_tags_from_filename(rename.new_path, current)
+    relevant = sorted(set(current) | set(expected))
+    before = {key: current.get(key, "") for key in relevant}
+    after = {key: expected.get(key, "") for key in relevant}
+    if before == after:
+        return None
+    digest = {"before": before, "after": after}
+    return TagProposal(
+        id=proposal_id("tag", rename.old_path, digest),
+        decision_group_id=rename.decision_group_id,
+        snapshot=snapshot,
+        path=rename.old_path,
+        before=before,
+        after=after,
+        confidence=rename.confidence,
+        reason="Sync tags to the proposed filename.",
+    )
+
+
+def coordinate_tag_proposals(
+    rename_proposals: list[RenameProposal],
+    tag_proposals: list[TagProposal],
+) -> tuple[list[TagProposal], list[dict], set[str]]:
+    """Align tags with each rename's reviewed final filename."""
+    existing_by_group = {
+        item.decision_group_id: item
+        for item in tag_proposals
+    }
+    coordinated: list[TagProposal] = []
+    issues: list[dict] = []
+    renamed_groups = set()
+    synchronized_paths = set()
+
+    for rename in rename_proposals:
+        renamed_groups.add(rename.decision_group_id)
+        synchronized_paths.add(path_key(rename.old_path))
+        try:
+            proposal = _coordinated_tag_proposal(
+                rename,
+                existing_by_group.get(rename.decision_group_id),
+            )
+        except ValueError as exc:
+            issues.append(
+                {
+                    "path": canonical_path(rename.old_path),
+                    "category": "tag-sync",
+                    "message": f"Tags were not prepared for this rename: {exc}",
+                }
+            )
+            continue
+        if proposal is not None:
+            coordinated.append(proposal)
+
+    coordinated.extend(
+        item
+        for item in tag_proposals
+        if item.decision_group_id not in renamed_groups
+    )
+    return coordinated, issues, synchronized_paths
+
+
+def _mark_unready_destinations(
+    proposals: list[RenameProposal],
+    destinations: dict[str, list[int]],
+) -> list[RenameProposal]:
+    source_keys = {path_key(item.old_path) for item in proposals}
+    updated = list(proposals)
+    for indexes in destinations.values():
+        if len(indexes) < 2:
+            continue
+        for index in indexes:
+            updated[index] = _with_rename_warning(
+                updated[index],
+                "Destination collides with another proposal.",
+            )
+    for index, item in enumerate(updated):
+        if (
+            Path(item.new_path).exists()
+            and path_key(item.new_path) not in source_keys
+        ):
+            updated[index] = _with_rename_warning(
+                item,
+                f"Destination already exists: {item.new_path}",
+            )
+    return updated
+
+
+def refresh_rename_readiness(
+    proposals: list[RenameProposal] | tuple[RenameProposal, ...],
+) -> list[RenameProposal]:
+    """Mark destination conflicts that are known during review."""
+    cleaned = [_without_readiness_warnings(item) for item in proposals]
+    destinations: dict[str, list[int]] = {}
+    for index, item in enumerate(cleaned):
+        destinations.setdefault(path_key(item.new_path), []).append(index)
+    return _mark_unready_destinations(cleaned, destinations)
+
+
+def _uses_online_extraction(strategy: str | None, acoustid_key: str | None) -> bool:
+    return bool(
+        acoustid_key
+        and strategy not in {"regular", "filename_norm", "musicbrainz"}
+    )
+
+
+def _extract_tracks(
+    paths: list[str],
+    strategy: str | None,
+    acoustid_key: str | None,
+    progress: ProgressCallback | None,
+    cancel_event,
+) -> dict[int, tuple[TrackInfo | None, Exception | None]]:
+    """Extract tracks in order, pipelining local fingerprints when online."""
+    def extract(path: str) -> tuple[TrackInfo | None, Exception | None]:
+        try:
+            return extract_track(
+                path,
+                strategy=strategy,
+                acoustid_key=acoustid_key,
+            ), None
+        except (OSError, ValueError) as exc:
+            return None, exc
+
+    if not paths:
+        return {}
+    if cancel_event is not None and cancel_event.is_set():
+        return {}
+
+    if not _uses_online_extraction(strategy, acoustid_key):
+        tracks = {}
+        for index, path in enumerate(paths):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            _emit(progress, "extract", index + 1, len(paths), path)
+            tracks[index] = extract(path)
+        return tracks
+
+    tracks: dict[int, tuple[object | None, Exception | None]] = {}
+    executor = ThreadPoolExecutor(
+        max_workers=min(_ONLINE_EXTRACTION_WORKERS, len(paths)),
+        thread_name_prefix="ballad-fingerprint",
+    )
+    futures = {}
+    next_index = 0
+    completed = 0
+    try:
+        while next_index < len(paths) and len(futures) < _ONLINE_EXTRACTION_WORKERS:
+            futures[executor.submit(extract, paths[next_index])] = next_index
+            next_index += 1
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                index = futures.pop(future)
+                tracks[index] = future.result()
+                completed += 1
+                _emit(progress, "extract", completed, len(paths), paths[index])
+            if cancel_event is not None and cancel_event.is_set():
+                for future in futures:
+                    future.cancel()
+                break
+            while next_index < len(paths) and len(futures) < _ONLINE_EXTRACTION_WORKERS:
+                futures[executor.submit(extract, paths[next_index])] = next_index
+                next_index += 1
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    return tracks
+
+
 def plan_renames(
     folder_path: str,
     strategy: str | None = None,
@@ -131,18 +341,32 @@ def plan_renames(
     paths = scan_folder(folder_path, recursive=recursive)
     proposals: list[RenameProposal] = []
     issues: list[dict] = []
-    destinations: dict[str, list[int]] = {}
+    extracted = _extract_tracks(
+        paths,
+        strategy,
+        acoustid_key,
+        progress,
+        cancel_event,
+    )
 
     for index, path in enumerate(paths, start=1):
-        if cancel_event is not None and cancel_event.is_set():
+        result = extracted.get(index - 1)
+        if result is None:
             break
-        _emit(progress, "extract", index, len(paths), path)
-        try:
-            track = extract_track(
-                path,
-                strategy=strategy,
-                acoustid_key=acoustid_key,
+        track, extraction_error = result
+        if extraction_error is not None:
+            issues.append(
+                {
+                    "path": canonical_path(path),
+                    "category": "rename",
+                    "message": str(extraction_error),
+                }
             )
+            continue
+        _emit(progress, "review", index, len(paths), path)
+        try:
+            if track is None:
+                raise ValueError("No extractable identity")
             online_conflict = False
             conflict = _tag_filename_conflict(path, track)
             if conflict:
@@ -228,7 +452,6 @@ def plan_renames(
                 reason=reason,
                 warnings=tuple(warnings),
             )
-            destinations.setdefault(path_key(new_path), []).append(len(proposals))
             proposals.append(item)
         except (OSError, ValueError) as exc:
             issues.append(
@@ -239,22 +462,7 @@ def plan_renames(
                 }
             )
 
-    for indexes in destinations.values():
-        if len(indexes) < 2:
-            continue
-        for index in indexes:
-            item = proposals[index]
-            warnings = tuple(item.warnings) + (
-                "Destination collides with another proposal.",
-            )
-            proposals[index] = RenameProposal(
-                **{
-                    **item.to_dict(),
-                    "snapshot": item.snapshot,
-                    "warnings": warnings,
-                }
-            )
-    return proposals, issues
+    return refresh_rename_readiness(proposals), issues
 
 
 def plan_tag_updates(
@@ -304,31 +512,16 @@ def analyze_folder(
         progress=progress,
         cancel_event=cancel_event,
     )
-    tag_by_group = {item.decision_group_id: item for item in tag_proposals}
-    for index, rename in enumerate(rename_proposals):
-        tag = tag_by_group.get(rename.decision_group_id)
-        if tag is None:
-            continue
-        if _proposal_identity(rename.proposed_values) == _proposal_identity(
-            tag.after
-        ):
-            continue
-        rename_proposals[index] = RenameProposal(
-            **{
-                **rename.to_dict(),
-                "snapshot": rename.snapshot,
-                "warnings": tuple(rename.warnings)
-                + ("Conflicts with filename-derived tag repair.",),
-            }
-        )
-        tag_proposals[tag_proposals.index(tag)] = type(tag)(
-            **{
-                **tag.to_dict(),
-                "snapshot": tag.snapshot,
-                "warnings": tuple(tag.warnings)
-                + ("Conflicts with tag-derived rename.",),
-            }
-        )
+    tag_proposals, coordination_issues, synchronized_paths = coordinate_tag_proposals(
+        rename_proposals,
+        tag_proposals,
+    )
+    tag_issues = [
+        issue
+        for issue in tag_issues
+        if path_key(issue.get("path", "")) not in synchronized_paths
+    ]
+    tag_issues.extend(coordination_issues)
     duplicate_findings = []
     duplicate_issues = []
     if include_duplicates and not (
@@ -366,4 +559,10 @@ def analyze_folder(
     )
 
 
-__all__ = ["analyze_folder", "plan_renames", "plan_tag_updates"]
+__all__ = [
+    "analyze_folder",
+    "coordinate_tag_proposals",
+    "plan_renames",
+    "plan_tag_updates",
+    "refresh_rename_readiness",
+]

@@ -332,10 +332,11 @@ def extract_track(
       'musicbrainz'   — treat as track-number file, flag for lookup
       None / anything else — auto-detect from tags + optional fingerprinting
 
-    acoustid_key: when provided, files with missing or junk tags are fingerprinted
-                  via AcoustID before falling back to filename_norm.
-    prefer_acoustid: when true, try the audio identity before trusting conflicting
-                     but otherwise readable embedded tags.
+    acoustid_key: when provided, a successful AcoustID match takes precedence over
+                  embedded tags. If no match is available, normal tag and filename
+                  fallbacks remain in effect.
+    prefer_acoustid: retained for compatibility; AcoustID is now preferred
+                     automatically whenever a key is provided.
     """
     ext = os.path.splitext(path)[1].lower()
     if ext not in AUDIO_EXTENSIONS:
@@ -345,15 +346,29 @@ def extract_track(
     if strategy == 'musicbrainz':
         return _from_musicbrainz_lookup(path, ext)
 
-    tags = _read_tags(path)
-    filename = os.path.basename(path)
-    is_ocremix = _detect_ocremix(tags, filename)
-
     if strategy == 'regular':
         return _from_filename(path, ext, is_ocremix=False)
 
     if strategy == 'filename_norm':
-        return _from_filename(path, ext, is_ocremix)
+        tags = _read_tags(path)
+        return _from_filename(
+            path,
+            ext,
+            is_ocremix=_detect_ocremix(tags, os.path.basename(path)),
+        )
+
+    if acoustid_key and (prefer_acoustid or strategy not in {
+        'regular',
+        'filename_norm',
+        'musicbrainz',
+    }):
+        result = _from_acoustid(path, ext, acoustid_key)
+        if result:
+            return result
+
+    tags = _read_tags(path)
+    filename = os.path.basename(path)
+    is_ocremix = _detect_ocremix(tags, filename)
 
     # Auto-detect from tags
     has_writer_ocremix_tags = bool(
@@ -368,11 +383,6 @@ def extract_track(
     has_basic_tags = bool(artist_tag or title_tag)
     tags_are_good  = has_basic_tags and not (_is_junk_tag(artist_tag) or _is_junk_tag(title_tag))
 
-    if prefer_acoustid and acoustid_key:
-        result = _from_acoustid(path, ext, acoustid_key)
-        if result:
-            return result
-
     if is_ocremix and has_writer_ocremix_tags:
         return _from_ocremix_writer_tags(path, ext, tags)
 
@@ -384,11 +394,5 @@ def extract_track(
 
     if tags_are_good:
         return _from_tags(path, ext, tags)
-
-    # Tags absent or junk — try AcoustID fingerprinting if a key was supplied
-    if acoustid_key:
-        result = _from_acoustid(path, ext, acoustid_key)
-        if result:
-            return result
 
     return _from_filename(path, ext, is_ocremix)

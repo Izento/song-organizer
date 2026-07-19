@@ -1,11 +1,10 @@
 # pylint: disable=broad-exception-caught,import-error
 
 """
-tag_writer.py — Sync ID3/metadata tags from the current filename.
+tag_writer.py — Write reviewed canonical metadata tags.
 
-Parses the normalized filename that formatter.py produced and writes
-the correct artist/title/album tags back into the audio file so
-Winamp (and other players) display the right information.
+The filename parser remains available for legacy CLI callers, but reviewed
+GUI plans write their explicit artist/title/album values directly.
 
 Supported formats:
   Regular:   "Artist - Title (feat. X, Y).mp3"  -> TPE1=Artist, TIT2=full title
@@ -15,7 +14,7 @@ Supported formats:
 import os
 import re
 
-from .media import canonical_to_id3, read_media
+from .media import read_media
 from .regular_parser import (
     format_title,
     normalize_title_text,
@@ -131,39 +130,49 @@ def parse_stem(stem: str) -> dict | None:
     return {'is_ocremix': False, 'artist': artist, 'full_title': full_title}
 
 
-# ---------------------------------------------------------------------------
-# Current-tag reading (for the "already OK?" check)
-# ---------------------------------------------------------------------------
+_CANONICAL_TAG_KEYS = {
+    "artist",
+    "title",
+    "album",
+    "album_artist",
+    "grouping",
+    "subtitle",
+}
 
-def _read_current_tags(path: str) -> dict:
-    """Read the key display tags from a file. Returns {} on any failure."""
-    media = read_media(path)
-    return canonical_to_id3(media.tags)
+
+def _parsed_tag_values(parsed: dict) -> dict[str, str]:
+    if not parsed["is_ocremix"]:
+        return {
+            "artist": parsed["artist"],
+            "title": parsed["full_title"],
+        }
+    return {
+        "artist": parsed["game"],
+        "title": parsed["title"],
+        "album": parsed["game"],
+        "album_artist": "OverClocked ReMix",
+        "grouping": parsed["game"],
+        "subtitle": ", ".join(parsed["remixers"]),
+    }
 
 
-def _tags_match(parsed: dict, current: dict) -> bool:
-    """Return True if the file's existing tags already match what we'd write."""
-    if parsed['is_ocremix']:
-        expected_remixers = ', '.join(parsed['remixers']) if parsed['remixers'] else ''
-        return (
-            current.get('TPE1', '') == parsed['game']
-            and current.get('TIT2', '') == parsed['title']
-            and current.get('TALB', '') == parsed['game']
-            and current.get('TPE2', '') == 'OverClocked ReMix'
-            and current.get('TIT1', '') == parsed['game']
-            and current.get('TIT3', '') == expected_remixers
-        )
-    return (
-        current.get('TPE1', '') == parsed['artist']
-        and current.get('TIT2', '') == parsed['full_title']
-    )
+def _expected_tag_values(values: dict[str, str]) -> dict[str, str]:
+    return {
+        key: str(value or "")
+        for key, value in values.items()
+        if key in _CANONICAL_TAG_KEYS
+    }
+
+
+def _tags_match(expected: dict[str, str], current: dict[str, str]) -> bool:
+    return all(current.get(key, "") == value for key, value in expected.items())
 
 
 # ---------------------------------------------------------------------------
 # Tag writing — format-specific helpers
 # ---------------------------------------------------------------------------
 
-def _write_mp3(path: str, parsed: dict):
+def _write_mp3(path: str, values: dict[str, str]):
     from mutagen.id3 import (
         ID3, TIT2, TPE1, TALB, TPE2, TIT1, TIT3, ID3NoHeaderError,
     )
@@ -173,27 +182,25 @@ def _write_mp3(path: str, parsed: dict):
         # File has only ID3v1 or no tags at all — create a fresh ID3v2 block
         tags = ID3()
 
-    if parsed['is_ocremix']:
-        # Artist = game name so Winamp groups all tracks from the same game together
-        tags.setall('TPE1', [TPE1(encoding=3, text=[parsed['game']])])
-        tags.setall('TIT2', [TIT2(encoding=3, text=[parsed['title']])])
-        tags.setall('TALB', [TALB(encoding=3, text=[parsed['game']])])
-        tags.setall('TPE2', [TPE2(encoding=3, text=['OverClocked ReMix'])])
-        # TIT1 = content group (game), TIT3 = subtitle (remixer list)
-        tags.setall('TIT1', [TIT1(encoding=3, text=[parsed['game']])])
-        remixer_str = ', '.join(parsed['remixers']) if parsed['remixers'] else ''
-        if remixer_str:
-            tags.setall('TIT3', [TIT3(encoding=3, text=[remixer_str])])
+    frames = {
+        "artist": ("TPE1", TPE1),
+        "title": ("TIT2", TIT2),
+        "album": ("TALB", TALB),
+        "album_artist": ("TPE2", TPE2),
+        "grouping": ("TIT1", TIT1),
+        "subtitle": ("TIT3", TIT3),
+    }
+    for key, value in values.items():
+        frame_id, frame_type = frames[key]
+        if value:
+            tags.setall(frame_id, [frame_type(encoding=3, text=[value])])
         else:
-            tags.delall('TIT3')
-    else:
-        tags.setall('TPE1', [TPE1(encoding=3, text=[parsed['artist']])])
-        tags.setall('TIT2', [TIT2(encoding=3, text=[parsed['full_title']])])
+            tags.delall(frame_id)
 
     tags.save(path, v2_version=3)
 
 
-def _write_vorbis(path: str, parsed: dict):
+def _write_vorbis(path: str, values: dict[str, str]):
     ext = os.path.splitext(path)[1].lower()
     if ext == '.flac':
         from mutagen.flac import FLAC
@@ -202,58 +209,66 @@ def _write_vorbis(path: str, parsed: dict):
         from mutagen.oggvorbis import OggVorbis
         f = OggVorbis(path)
 
-    if parsed['is_ocremix']:
-        f['artist'] = [parsed['game']]
-        f['title'] = [parsed['title']]
-        f['album'] = [parsed['game']]
-        f['albumartist'] = ['OverClocked ReMix']
-        f['grouping'] = [parsed['game']]
-        f['subtitle'] = [', '.join(parsed['remixers'])]
-    else:
-        f['artist'] = [parsed['artist']]
-        f['title'] = [parsed['full_title']]
+    keys = {
+        "artist": "artist",
+        "title": "title",
+        "album": "album",
+        "album_artist": "albumartist",
+        "grouping": "grouping",
+        "subtitle": "subtitle",
+    }
+    for key, value in values.items():
+        target = keys[key]
+        if value:
+            f[target] = [value]
+        elif target in f:
+            del f[target]
 
     f.save()
 
 
-def _write_mp4(path: str, parsed: dict):
+def _write_mp4(path: str, values: dict[str, str]):
     from mutagen.mp4 import MP4
     f = MP4(path)
     if f.tags is None:
         f.add_tags()
 
-    if parsed['is_ocremix']:
-        f.tags['\xa9ART'] = [parsed['game']]
-        f.tags['\xa9nam'] = [parsed['title']]
-        f.tags['\xa9alb'] = [parsed['game']]
-        f.tags['aART'] = ['OverClocked ReMix']
-        f.tags['\xa9grp'] = [parsed['game']]
-        f.tags['----:com.apple.iTunes:SUBTITLE'] = [
-            ', '.join(parsed['remixers']).encode('utf-8')
-        ]
-    else:
-        f.tags['\xa9ART'] = [parsed['artist']]
-        f.tags['\xa9nam'] = [parsed['full_title']]
+    keys = {
+        "artist": "\xa9ART",
+        "title": "\xa9nam",
+        "album": "\xa9alb",
+        "album_artist": "aART",
+        "grouping": "\xa9grp",
+        "subtitle": "----:com.apple.iTunes:SUBTITLE",
+    }
+    for key, value in values.items():
+        target = keys[key]
+        if value:
+            f.tags[target] = [value.encode("utf-8")] if key == "subtitle" else [value]
+        else:
+            f.tags.pop(target, None)
 
     f.save()
 
 
-def _write_asf(path: str, parsed: dict):
+def _write_asf(path: str, values: dict[str, str]):
     from mutagen.asf import ASF, ASFUnicodeAttribute
     f = ASF(path)
 
-    if parsed['is_ocremix']:
-        f['Author'] = [ASFUnicodeAttribute(parsed['game'])]
-        f['Title'] = [ASFUnicodeAttribute(parsed['title'])]
-        f['WM/AlbumTitle'] = [ASFUnicodeAttribute(parsed['game'])]
-        f['WM/AlbumArtist'] = [ASFUnicodeAttribute('OverClocked ReMix')]
-        f['WM/ContentGroupDescription'] = [ASFUnicodeAttribute(parsed['game'])]
-        f['WM/SubTitle'] = [
-            ASFUnicodeAttribute(', '.join(parsed['remixers']))
-        ]
-    else:
-        f['Author'] = [ASFUnicodeAttribute(parsed['artist'])]
-        f['Title'] = [ASFUnicodeAttribute(parsed['full_title'])]
+    keys = {
+        "artist": "Author",
+        "title": "Title",
+        "album": "WM/AlbumTitle",
+        "album_artist": "WM/AlbumArtist",
+        "grouping": "WM/ContentGroupDescription",
+        "subtitle": "WM/SubTitle",
+    }
+    for key, value in values.items():
+        target = keys[key]
+        if value:
+            f[target] = [ASFUnicodeAttribute(value)]
+        elif target in f:
+            del f[target]
 
     f.save()
 
@@ -262,9 +277,15 @@ def _write_asf(path: str, parsed: dict):
 # Public API
 # ---------------------------------------------------------------------------
 
-def write_tags_to_file(path: str) -> dict:
+def write_tags_to_file(
+    path: str,
+    expected_tags: dict[str, str] | None = None,
+) -> dict:
     """
-    Parse the filename and write matching tags to the audio file.
+    Write reviewed canonical tags to an audio file.
+
+    When expected_tags is omitted, preserve the legacy filename-derived
+    behavior for CLI callers.
 
     Returns:
       {'status': 'updated'}                      — tags were written
@@ -288,24 +309,28 @@ def write_tags_to_file(path: str) -> dict:
             'reason': 'Raw AAC is not a writable MP4 container',
         }
 
-    stem = os.path.splitext(os.path.basename(path))[0]
-    parsed = parse_stem(stem)
-    if parsed is None:
-        return {'status': 'skipped', 'reason': 'Filename not in expected format'}
+    if expected_tags is None:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        parsed = parse_stem(stem)
+        if parsed is None:
+            return {'status': 'skipped', 'reason': 'Filename not in expected format'}
+        expected_tags = _parsed_tag_values(parsed)
 
-    current = _read_current_tags(path)
-    if _tags_match(parsed, current):
+    expected = _expected_tag_values(expected_tags)
+    if not expected:
+        return {'status': 'skipped', 'reason': 'No supported tag values to write'}
+    if _tags_match(expected, media.tags):
         return {'status': 'already_ok'}
 
     try:
         if ext == '.mp3':
-            _write_mp3(path, parsed)
+            _write_mp3(path, expected)
         elif ext in ('.flac', '.ogg'):
-            _write_vorbis(path, parsed)
+            _write_vorbis(path, expected)
         elif ext in ('.m4a', '.aac'):
-            _write_mp4(path, parsed)
+            _write_mp4(path, expected)
         elif ext == '.wma':
-            _write_asf(path, parsed)
+            _write_asf(path, expected)
         else:
             return {'status': 'skipped', 'reason': f'No writer for {ext}'}
         return {'status': 'updated'}

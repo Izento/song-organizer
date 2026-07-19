@@ -12,7 +12,11 @@ from .review_models import FileSnapshot, TagProposal, path_key, proposal_id
 from .tag_writer import supports_tag_writing
 
 
-def _expected_tags(path: str, current: dict[str, str]) -> tuple[dict[str, str], str]:
+def expected_tags_from_filename(
+    path: str,
+    current: dict[str, str],
+) -> tuple[dict[str, str], str]:
+    """Return canonical tag values represented by a supported filename."""
     if not supports_tag_writing(path):
         extension = Path(path).suffix.lower() or "this file type"
         raise ValueError(f"Tag writing is not supported for {extension} files")
@@ -57,7 +61,7 @@ def audit_tag_file(path: str) -> TagProposal | None:
     if not media.usable:
         raise OSError(f"{media.status}: {media.error or 'cannot read media'}")
     current = dict(media.tags)
-    expected, reason = _expected_tags(path, current)
+    expected, reason = expected_tags_from_filename(path, current)
     relevant = set(current) | set(expected)
     before = {key: current.get(key, "") for key in sorted(relevant)}
     after = {key: expected.get(key, "") for key in sorted(relevant)}
@@ -112,4 +116,8 @@ def audit_tags_for_folder(
     return proposals, issues
 
 
-__all__ = ["audit_tag_file", "audit_tags_for_folder"]
+__all__ = [
+    "audit_tag_file",
+    "audit_tags_for_folder",
+    "expected_tags_from_filename",
+]
