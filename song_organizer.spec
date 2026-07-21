@@ -40,7 +40,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="SongOrganizer",
+    name="Ballad",
     icon=str(icon),
     debug=False,
     bootloader_ignore_signals=False,
@@ -54,5 +54,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="SongOrganizer",
+    name="Ballad",
 )

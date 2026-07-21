@@ -55,7 +55,7 @@ Build a keyless one-folder Windows package with:
 .\build.ps1
 ```
 
-The package is written to `dist\SongOrganizer`. `fpcalc.exe` is optional and
+The public package is written to `release\public\Ballad`. `fpcalc.exe` is optional and
 ignored by Git. Place a vetted copy beside `song_organizer.spec` before a build
 only when fingerprinting is needed. The build bundles that helper when present;
 include its required third-party notices with any public binary release.
