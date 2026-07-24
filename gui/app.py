@@ -46,6 +46,7 @@ _TREE_STYLE = "Ballad.Treeview"
 _REVIEW_REQUIRED_WARNING_PREFIXES = (
     "Destination collides with another proposal.",
     "Destination already exists:",
+    "Version qualifier conflicts with AcoustID metadata;",
 )
 
 

@@ -176,6 +176,7 @@ def _coordinated_tag_proposal(
         after=after,
         confidence=rename.confidence,
         reason="Sync tags to the proposed filename.",
+        warnings=rename.warnings,
     )
 
 
@@ -430,6 +431,8 @@ def plan_renames(
                 warnings.append(f"Identity came from {track.strategy}.")
             if track.strategy == "acoustid" and track.acoustid_score is not None:
                 warnings.append(f"Audio match score: {track.acoustid_score:.3f}.")
+            if track.version_warning:
+                warnings.append(track.version_warning)
             if online_conflict:
                 warnings.append(
                     "Embedded tags conflicted with the filename and were not used."

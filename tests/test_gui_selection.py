@@ -13,6 +13,17 @@ from renamer.review_models import (
 )
 
 
+def test_version_qualifier_conflict_requires_manual_review():
+    proposal = SimpleNamespace(
+        warnings=(
+            "Version qualifier conflicts with AcoustID metadata; "
+            "review the proposed filename.",
+        )
+    )
+
+    assert gui_app._requires_review(proposal)
+
+
 class _FakeTree:
     def __init__(self, rows, selected=()):
         self.rows = rows

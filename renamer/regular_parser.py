@@ -7,6 +7,7 @@ being mistaken for contributor metadata.
 
 from __future__ import annotations
 
+from difflib import SequenceMatcher
 import re
 from dataclasses import dataclass
 
@@ -27,7 +28,25 @@ _FEATURE_IN_ARTIST_RE = re.compile(
 _SEPARATOR_RE = re.compile(r"\s+-\s+")
 _FALLBACK_SEPARATOR_RE = re.compile(r"\s*-\s*")
 _VERSION_RE = re.compile(r"[\(\[]\s*([^\)\]]+?)\s*[\)\]]")
+_TRAILING_VERSION_RE = re.compile(r"\s*\(([^()]*)\)\s*$")
 _WHITESPACE_RE = re.compile(r"\s+")
+_VERSION_LABEL_RE = re.compile(
+    r"\b(?:acoustic|album|clean|club|demo|edit|extended|instrumental|"
+    r"karaoke|live|mix|mono|original|radio|remaster(?:ed)?|reprise|"
+    r"single|stereo|version)\b",
+    re.IGNORECASE,
+)
+_INSTRUMENTAL_TOKEN = "instrumental"
+_INSTRUMENTAL_ABBREVIATIONS = frozenset(
+    {
+        "inst",
+        "instr",
+        "instrum",
+        "instrume",
+        "instrumen",
+        "instrument",
+    }
+)
 _PRODUCTION_SUFFIX_RE = re.compile(
     r"(?:\s+|\s*[-–—|]\s*)"
     r"[\(\[]?\s*(?:prod(?:uced)?(?:\s+by)?\.?|production\s+by)"
@@ -93,12 +112,48 @@ def _normalize_parentheses(value: str) -> str:
     return "".join(balanced)
 
 
+def _is_instrumental_token(value: str) -> bool:
+    """Return whether a word is Instrumental or a clear abbreviation/typo."""
+    word = value.casefold()
+    if word in _INSTRUMENTAL_ABBREVIATIONS:
+        return True
+    if not 9 <= len(word) <= 13:
+        return False
+    return SequenceMatcher(None, word, _INSTRUMENTAL_TOKEN).ratio() >= 0.9
+
+
+def _normalize_instrumental_spelling(value: str) -> str:
+    """Correct only clear misspellings of the version label ``Instrumental``."""
+    def replace(match: re.Match[str]) -> str:
+        word = match.group()
+        return "Instrumental" if _is_instrumental_token(word) else word
+
+    return re.sub(r"[A-Za-z]+", replace, value)
+
+
+def has_instrumental_qualifier(value: str) -> bool:
+    """Return whether a title explicitly labels the track as instrumental."""
+    return any(
+        _is_instrumental_token(word)
+        for word in re.findall(r"[A-Za-z]+", value)
+    )
+
+
+def is_version_qualifier(value: str) -> bool:
+    """Return whether a parenthetical label describes a track version."""
+    return bool(_VERSION_LABEL_RE.search(_normalize_instrumental_spelling(value)))
+
+
 def normalize_title_text(value: str) -> str:
     """Clean conservative title noise without changing the track identity."""
     text = strip_audio_extensions(value).replace("_", " ")
     text = _PRODUCTION_SUFFIX_RE.sub("", text)
     text = _PROMO_SUFFIX_RE.sub("", text)
     text = _normalize_parentheses(text)
+    text = _VERSION_RE.sub(
+        lambda match: f"({_normalize_instrumental_spelling(match.group(1))})",
+        text,
+    )
     return _WHITESPACE_RE.sub(" ", text).strip(" \t.-")
 
 
@@ -212,6 +267,19 @@ def _qualifiers(title: str) -> tuple[str, ...]:
     return tuple(values)
 
 
+def split_title_version_qualifiers(title: str) -> tuple[str, tuple[str, ...]]:
+    """Split trailing recognized version labels from a normalized title."""
+    remaining = normalize_title_text(title)
+    qualifiers: list[str] = []
+    while match := _TRAILING_VERSION_RE.search(remaining):
+        qualifier = _clean_text(_normalize_instrumental_spelling(match.group(1)))
+        if not qualifier or not is_version_qualifier(qualifier):
+            break
+        qualifiers.insert(0, qualifier)
+        remaining = _clean_text(remaining[: match.start()])
+    return remaining, tuple(qualifiers)
+
+
 def parse_regular_stem(stem: str) -> RegularName | None:
     """Parse a stem such as ``Artist - Title (feat. Guest) (Remix)``."""
     stem = normalize_title_text(stem)
@@ -269,11 +337,14 @@ def format_title(name: RegularName) -> str:
 __all__ = [
     "RegularName",
     "format_title",
+    "has_instrumental_qualifier",
+    "is_version_qualifier",
     "normalize_text",
     "normalize_title_text",
     "parse_regular_filename",
     "parse_regular_stem",
     "split_feature_names",
     "split_features",
+    "split_title_version_qualifiers",
     "strip_audio_extensions",
 ]

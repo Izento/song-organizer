@@ -1,4 +1,4 @@
-# pylint: disable=import-error
+# pylint: disable=import-error,protected-access
 
 from renamer import extractor
 from renamer.extractor import TrackInfo, extract_track
@@ -93,3 +93,52 @@ def test_explicit_filename_strategy_still_overrides_acoustid(
     assert result.strategy == "filename_norm"
     assert result.artist == "Filename Artist"
     assert result.title == "Filename Title"
+
+
+def test_acoustid_preserves_filename_instrumental_despite_identity_difference(tmp_path):
+    path = tmp_path / "2Pac - Pac's Life (Instrumnetal).mp3"
+    track = TrackInfo(
+        path=str(path),
+        ext=".mp3",
+        artist="T.I.",
+        title="A Different Recording",
+        strategy="acoustid",
+    )
+
+    result = extractor._preserve_filename_version_qualifiers(str(path), track)
+
+    assert result.title == "A Different Recording (Instrumental)"
+    assert result.version_warning == ""
+
+
+def test_acoustid_version_conflict_requires_review(tmp_path):
+    path = tmp_path / "Artist - Song (Instrumental).mp3"
+    track = TrackInfo(
+        path=str(path),
+        ext=".mp3",
+        artist="Artist",
+        title="Song (Radio Edit)",
+        strategy="acoustid",
+    )
+
+    result = extractor._preserve_filename_version_qualifiers(str(path), track)
+
+    assert result.title == "Song (Radio Edit) (Instrumental)"
+    assert result.version_warning.startswith(
+        "Version qualifier conflicts with AcoustID metadata;"
+    )
+
+
+def test_acoustid_preserves_unparenthesized_instrumental_label(tmp_path):
+    path = tmp_path / "Artist - Song Instrumental (Bonus Track).mp3"
+    track = TrackInfo(
+        path=str(path),
+        ext=".mp3",
+        artist="Artist",
+        title="Song",
+        strategy="acoustid",
+    )
+
+    result = extractor._preserve_filename_version_qualifiers(str(path), track)
+
+    assert result.title == "Song (Instrumental)"

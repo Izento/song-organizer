@@ -4,7 +4,14 @@ from dataclasses import dataclass, field
 
 from .formatter import split_feat, strip_ocremix_suffix
 from .media import read_media
-from .regular_parser import normalize_title_text, parse_regular_stem
+from .regular_parser import (
+    has_instrumental_qualifier,
+    normalize_text,
+    normalize_title_text,
+    parse_regular_filename,
+    parse_regular_stem,
+    split_title_version_qualifiers,
+)
 
 AUDIO_EXTENSIONS = {'.mp3', '.flac', '.ogg', '.m4a', '.aac', '.wma', '.wav'}
 
@@ -50,6 +57,7 @@ class TrackInfo:
     bitrate: int | None = None
     acoustid_score: float | None = None
     acoustid_recording_id: str = ''
+    version_warning: str = ''
 
 
 def scan_folder(folder_path: str, recursive: bool = True) -> list[str]:
@@ -292,7 +300,7 @@ def _from_acoustid(path: str, ext: str, api_key: str) -> 'TrackInfo | None':
     result = lookup(path, api_key)
     if not result:
         return None
-    return TrackInfo(
+    track = TrackInfo(
         path=path,
         ext=ext,
         artist=result['artist'],
@@ -302,6 +310,78 @@ def _from_acoustid(path: str, ext: str, api_key: str) -> 'TrackInfo | None':
         acoustid_score=result.get('score'),
         acoustid_recording_id=result.get('recording_id', ''),
     )
+    return _preserve_filename_version_qualifiers(path, track)
+
+
+def _qualifiers_agree(
+    filename_qualifiers: tuple[str, ...],
+    acoustid_qualifiers: tuple[str, ...],
+) -> bool:
+    if not filename_qualifiers or not acoustid_qualifiers:
+        return True
+    filename_values = {normalize_text(value) for value in filename_qualifiers}
+    acoustid_values = {normalize_text(value) for value in acoustid_qualifiers}
+    return all(
+        any(
+            filename_value in acoustid_value
+            or acoustid_value in filename_value
+            for acoustid_value in acoustid_values
+        )
+        for filename_value in filename_values
+    )
+
+
+def _preserve_filename_version_qualifiers(path: str, track: TrackInfo) -> TrackInfo:
+    """Retain local version labels that AcoustID metadata omits."""
+    filename = parse_regular_filename(os.path.basename(path))
+    if filename is None:
+        return track
+    if has_instrumental_qualifier(filename.title):
+        return _preserve_local_instrumental(track)
+
+    filename_base, filename_qualifiers = split_title_version_qualifiers(
+        filename.title
+    )
+    acoustid_base, acoustid_qualifiers = split_title_version_qualifiers(track.title)
+    if (
+        not filename_qualifiers
+        or normalize_text(filename.artist) != normalize_text(track.artist)
+        or normalize_text(filename_base) != normalize_text(acoustid_base)
+    ):
+        return track
+    if not _qualifiers_agree(filename_qualifiers, acoustid_qualifiers):
+        track.version_warning = (
+            "Version qualifier conflicts with AcoustID metadata; "
+            "review the proposed filename."
+        )
+        return track
+
+    known = {normalize_text(value) for value in acoustid_qualifiers}
+    missing = [
+        value
+        for value in filename_qualifiers
+        if normalize_text(value) not in known
+    ]
+    if missing:
+        track.title = " ".join(
+            [acoustid_base, *(f"({value})" for value in missing)]
+        )
+    return track
+
+
+def _preserve_local_instrumental(track: TrackInfo) -> TrackInfo:
+    """Treat an explicit filename Instrumental label as authoritative."""
+    if has_instrumental_qualifier(track.title):
+        return track
+
+    _base_title, acoustid_qualifiers = split_title_version_qualifiers(track.title)
+    if acoustid_qualifiers:
+        track.version_warning = (
+            "Version qualifier conflicts with AcoustID metadata; "
+            "review the proposed filename."
+        )
+    track.title = f"{normalize_title_text(track.title)} (Instrumental)"
+    return track
 
 
 # ---------------------------------------------------------------------------

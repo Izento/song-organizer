@@ -69,3 +69,19 @@ def test_missing_feature_parenthesis_is_repaired_without_losing_qualifier():
     assert parsed is not None
     assert parsed.title == "Song"
     assert parsed.features == ("Guest (Ripped Version)",)
+
+
+def test_instrumental_qualifier_typo_is_canonicalized():
+    parsed = parse_regular_filename("Artist - Song (Instrumnetal).mp3")
+
+    assert parsed is not None
+    assert parsed.title == "Song (Instrumental)"
+    assert parsed.qualifiers == ("Instrumental",)
+
+
+def test_instrumental_abbreviation_is_canonicalized():
+    parsed = parse_regular_filename("Artist - Song (instrume).mp3")
+
+    assert parsed is not None
+    assert parsed.title == "Song (Instrumental)"
+    assert parsed.qualifiers == ("Instrumental",)
