@@ -21,7 +21,7 @@ test = ["pytest>=8.0.0"]
 build = ["pyinstaller>=6.0.0"]
 
 [project.scripts]
-song-organizer = "main:main"
+ballad = "cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -30,4 +30,4 @@ testpaths = ["tests"]
 py-modules = ["main"]
 
 [tool.setuptools.packages.find]
-include = ["renamer*", "gui*"]
+include = ["cli*", "renamer*", "gui*"]

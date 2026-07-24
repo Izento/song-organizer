@@ -17,3 +17,13 @@ def test_acoustid_key_can_come_from_environment(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime, "app_data_dir", lambda: tmp_path / "app")
 
     assert runtime.resolve_acoustid_key() == "test-key"
+
+
+def test_frozen_app_uses_fpcalc_beside_executable(monkeypatch, tmp_path):
+    executable = tmp_path / "Ballad.exe"
+    fpcalc = tmp_path / "fpcalc.exe"
+    fpcalc.touch()
+    monkeypatch.setattr(runtime.sys, "executable", str(executable))
+    monkeypatch.setattr(runtime.sys, "frozen", True, raising=False)
+
+    assert runtime.resolve_fpcalc() == str(fpcalc)

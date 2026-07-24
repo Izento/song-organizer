@@ -52,12 +52,16 @@ def resource_path(name: str) -> Path:
 
 
 def resolve_fpcalc() -> str | None:
-    """Find the bundled fingerprint helper before consulting PATH."""
-    for candidate in (
+    """Find the adjacent or bundled fingerprint helper before consulting PATH."""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).parent / "fpcalc.exe")
+    candidates.extend((
         resource_path("fpcalc.exe"),
         resource_path("bin") / "fpcalc.exe",
         resource_path("fpcalc"),
-    ):
+    ))
+    for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
     return shutil.which("fpcalc") or shutil.which("fpcalc.exe")

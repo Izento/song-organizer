@@ -209,11 +209,12 @@ class SongOrganizerApp:
 
         self.folder_var = tk.StringVar()
         self.recursive_var = tk.BooleanVar(value=True)
-        self.fingerprint_var = tk.BooleanVar(value=False)
+        fpcalc_path = resolve_fpcalc()
+        self.fingerprint_var = tk.BooleanVar(value=fpcalc_path is not None)
         self.status_var = tk.StringVar(value="Choose a folder to begin.")
         self.acoustid_key = resolve_acoustid_key()
         fpcalc_state = (
-            "available" if resolve_fpcalc() else "not installed (optional)"
+            "available" if fpcalc_path else "not installed (optional)"
         )
         online_state = "enabled" if self.acoustid_key else "skipped"
         self.capability_var = tk.StringVar(
